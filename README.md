@@ -6,16 +6,16 @@
 
 ## 技术栈
 
-| 分类 | 实际使用 |
-|---|---|
-| 开发语言 | ArkTS / TypeScript |
-| UI 框架 | ArkUI 声明式开发，Stage 模型 |
-| 状态管理 | 状态管理 V2：`@Local`、`@ObservedV2`、`@Trace`、`AppStorageV2.connect` |
-| 页面导航 | `Navigation` + `NavPathStack` |
-| 布局与列表 | `Tabs`、`Swiper`、`ForEach` + `ListItem`、`@Builder` 自定义构建函数 |
-| 音频播放 | `@kit.MediaKit` AVPlayer（`stateChange` / `timeUpdate` 事件监听） |
-| 后台播控 | `@kit.AVSessionKit`，创建 audio 类型 AVSession |
-| 工程工具 | DevEco Studio、Hvigor、hvigorfile.ts |
+| 分类    | 实际使用                                                           |
+| ----- | -------------------------------------------------------------- |
+| 开发语言  | ArkTS / TypeScript                                             |
+| UI 框架 | ArkUI 声明式开发，Stage 模型                                           |
+| 状态管理  | 状态管理 V2：`@Local`、`@ObservedV2`、`@Trace`、`AppStorageV2.connect` |
+| 页面导航  | `Navigation` + `NavPathStack`                                  |
+| 布局与列表 | `Tabs`、`Swiper`、`ForEach` + `ListItem`、`@Builder` 自定义构建函数      |
+| 音频播放  | `@kit.MediaKit` AVPlayer（`stateChange` / `timeUpdate` 事件监听）    |
+| 后台播控  | `@kit.AVSessionKit`，创建 audio 类型 AVSession                      |
+| 工程工具  | DevEco Studio、Hvigor、hvigorfile.ts                             |
 
 ## 项目结构
 
