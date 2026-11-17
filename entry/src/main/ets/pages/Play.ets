@@ -388,8 +388,7 @@ struct Play {
                 .width(56)
                 .fillColor(Color.White)
                 .onClick(() => {
-                  this.playState.isPlay ? playerManager.pause() :
-                    playerManager.singPlay(this.playState.playList[this.playState.playIndex])
+                  playerManager.playOrPause()
                 })
 
               // 下一首

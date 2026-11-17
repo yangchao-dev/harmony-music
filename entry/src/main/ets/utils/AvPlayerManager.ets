@@ -6,8 +6,20 @@ import { sessionManager } from '../utils/AvSessionManager'
 import { getLyricBySongName } from '../models/lyricData'
 
 class AvPlayerManager {
-  playOrPause() {
-    throw new Error('Method not implemented.')
+  // 播放/暂停切换：按当前状态二选一
+  async playOrPause() {
+    if (!this.player || this.currentSong.playList.length === 0) {
+      return
+    }
+    if (this.currentSong.isPlay) {
+      await this.pause()
+    } else {
+      this.player.play()
+      this.currentSong.isPlay = true
+      // 同步 AVSession 播放状态（控制中心/胶囊按钮），后台时更新通知
+      await sessionManager.setAvPlayBackState(true)
+      sessionManager.publishMediaNotification(this.currentSong.name, this.currentSong.author)
+    }
   }
   // 播放器
   player: media.AVPlayer | null = null
