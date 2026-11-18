@@ -3,6 +3,7 @@ import { Found } from '../component/Found'
 import { Mine } from '../component/Mine'
 import { Moment } from '../component/Moment'
 import { Recommend } from '../component/Recommend'
+import { bindUIContext } from '../utils/Toast'
 
 
 interface TabClass {
@@ -31,6 +32,11 @@ struct Layout {
     { text: '动态', icon: $r('app.media.ic_moment') },
     { text: '我的', icon: $r('app.media.ic_mine') }
   ]
+
+  aboutToAppear(): void {
+    // 注册 UIContext，供 utils/Toast 统一弹出轻提示（避免使用已废弃的全局 promptAction）
+    bindUIContext(this.getUIContext())
+  }
 
   @Builder
   tabBuilder(item: TabClass, index: number) {

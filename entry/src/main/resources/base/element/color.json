@@ -3,6 +3,126 @@
     {
       "name": "start_window_background",
       "value": "#FFFFFF"
+    },
+    {
+      "name": "brand_primary",
+      "value": "#EC4141"
+    },
+    {
+      "name": "brand_primary_light",
+      "value": "#FF6B6B"
+    },
+    {
+      "name": "accent_gold",
+      "value": "#D4A74A"
+    },
+    {
+      "name": "accent_gold_soft",
+      "value": "#FFD4A74A"
+    },
+    {
+      "name": "text_primary",
+      "value": "#FFFFFF"
+    },
+    {
+      "name": "text_secondary",
+      "value": "#CCCCCC"
+    },
+    {
+      "name": "text_tertiary",
+      "value": "#BBBBBB"
+    },
+    {
+      "name": "text_quaternary",
+      "value": "#888888"
+    },
+    {
+      "name": "text_disabled",
+      "value": "#666666"
+    },
+    {
+      "name": "text_faint",
+      "value": "#555555"
+    },
+    {
+      "name": "icon_muted",
+      "value": "#444444"
+    },
+    {
+      "name": "bg_page",
+      "value": "#131313"
+    },
+    {
+      "name": "bg_section",
+      "value": "#1A1A1A"
+    },
+    {
+      "name": "bg_gap",
+      "value": "#0F0F0F"
+    },
+    {
+      "name": "bg_panel",
+      "value": "#1E1E1E"
+    },
+    {
+      "name": "bg_elevated",
+      "value": "#2A2A2A"
+    },
+    {
+      "name": "bg_elevated_hover",
+      "value": "#3A3A3A"
+    },
+    {
+      "name": "border_subtle",
+      "value": "#2A2A2A"
+    },
+    {
+      "name": "border_dashed",
+      "value": "#3A3A3A"
+    },
+    {
+      "name": "divider_light",
+      "value": "#1FFFFFFF"
+    },
+    {
+      "name": "divider_white_30",
+      "value": "#4DFFFFFF"
+    },
+    {
+      "name": "overlay_light",
+      "value": "#0DFFFFFF"
+    },
+    {
+      "name": "overlay_dark_30",
+      "value": "#4D000000"
+    },
+    {
+      "name": "overlay_dark_40",
+      "value": "#66000000"
+    },
+    {
+      "name": "overlay_dark_50",
+      "value": "#80000000"
+    },
+    {
+      "name": "bg_badge_obtained",
+      "value": "#2A2520"
+    },
+    {
+      "name": "bg_badge_locked",
+      "value": "#1A1A1A"
+    },
+    {
+      "name": "bg_recent_playall",
+      "value": "#2A2020"
+    },
+    {
+      "name": "nav_icon_dark",
+      "value": "#333333"
+    },
+    {
+      "name": "nav_text_dark",
+      "value": "#666666"
     }
   ]
 }

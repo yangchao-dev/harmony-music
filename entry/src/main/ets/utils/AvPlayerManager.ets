@@ -1,154 +1,264 @@
 import { media } from '@kit.MediaKit'
-import { GlobalMusic } from '../models/globalMusic'
+import { BusinessError } from '@kit.BasicServicesKit'
 import { SongItemType } from '../models/music'
-import { AppStorageV2 } from '@kit.ArkUI'
-import { sessionManager } from '../utils/AvSessionManager'
 import { getLyricBySongName } from '../models/lyricData'
+import { toast } from './Toast'
+import { hilog } from '@kit.PerformanceAnalysisKit'
+import { PlayerState, getPlayerState } from '../models/PlayerState'
+import { PlaybackObserver } from '../models/PlaybackObserver'
+import { preferencesService } from '../models/UserSettings'
+
+const DOMAIN = 0x0002
 
 class AvPlayerManager {
+  // 播放器
+  player: media.AVPlayer | null = null
+  // 共享播放数据（统一从 PlayerState 模块获取）
+  currentSong: PlayerState = getPlayerState()
+
+  private isInitialized: boolean = false
+  private initPromise: Promise<void> | null = null
+  // 事件观察者（如 AvSessionManager），可为空
+  private observer: PlaybackObserver | null = null
+
+  /** 注册播放事件观察者 */
+  setObserver(observer: PlaybackObserver) {
+    this.observer = observer
+  }
+
+  // 确保播放器已创建并注册监听（幂等，避免竞态导致 player 为 null）
+  async init(): Promise<void> {
+    if (this.isInitialized && this.player) {
+      return
+    }
+    if (!this.initPromise) {
+      this.initPromise = this.createPlayer()
+    }
+    return this.initPromise
+  }
+
+  private async createPlayer(): Promise<void> {
+    try {
+      if (!this.player) {
+        this.player = await media.createAVPlayer()
+      }
+      const player = this.player
+      const state = this.currentSong
+
+      player.on('stateChange', (s) => {
+        hilog.info(DOMAIN, 'testTag', 'AVPlayer state: %{public}s', s)
+        switch (s) {
+          case 'initialized':
+            player.prepare().catch((err: BusinessError) => {
+              hilog.error(DOMAIN, 'testTag', 'prepare failed: %{public}s', JSON.stringify(err))
+            })
+            break
+          case 'prepared':
+            player.play().catch((err: BusinessError) => {
+              hilog.error(DOMAIN, 'testTag', 'play failed: %{public}s', JSON.stringify(err))
+              state.isPlay = false
+              this.observer?.onPlayStateChanged(false)
+            })
+            break
+          case 'playing':
+            // 以播放器实际状态为准同步，保证桌面卡片/灵动岛图标与真实状态一致
+            if (!state.isPlay) {
+              state.isPlay = true
+              this.observer?.onPlayStateChanged(true)
+            }
+            break
+          case 'paused':
+            if (state.isPlay) {
+              state.isPlay = false
+              this.observer?.onPlayStateChanged(false)
+            }
+            break
+          case 'completed':
+            this.nextPlay(true)
+            break
+          case 'released':
+            state.isPlay = false
+            break
+          case 'error':
+            state.isPlay = false
+            break
+          default:
+            break
+        }
+      })
+
+      // 歌曲总时长
+      player.on('durationUpdate', (duration) => {
+        state.duration = duration
+        this.observer?.onDuration(duration)
+      })
+
+      // 当前播放时间（进度条依赖此回调）
+      player.on('timeUpdate', (time) => {
+        state.time = time
+        this.observer?.onProgress(time)
+      })
+
+      // 播放出错：复位状态并给出可见反馈，避免"点了没反应"
+      player.on('error', (err: BusinessError) => {
+        hilog.error(DOMAIN, 'testTag', 'AVPlayer error: %{public}s', JSON.stringify(err))
+        state.isPlay = false
+        // 同步暂停状态到系统媒体控制，避免图标停留在"播放中"
+        this.observer?.onPlayStateChanged(false)
+        toast({ message: '播放失败，请检查网络或歌曲地址', duration: 2000 })
+      })
+
+      this.isInitialized = true
+      hilog.info(DOMAIN, 'testTag', 'AVPlayer initialized')
+    } catch (err) {
+      hilog.error(DOMAIN, 'testTag', 'createAVPlayer failed: %{public}s', JSON.stringify(err))
+      this.initPromise = null
+    }
+  }
+
+  // 后台/系统媒体控制的"播放"命令：健壮地从暂停状态恢复
+  async resumeOrPlay() {
+    if (this.currentSong.playList.length === 0) {
+      return
+    }
+    // 已暂停且有资源：尝试直接续播
+    if (this.player && this.currentSong.url) {
+      try {
+        await this.player.play()
+        hilog.info(DOMAIN, 'testTag', 'resumeOrPlay: resumed')
+        return
+      } catch (err) {
+        hilog.warn(DOMAIN, 'testTag', 'resumeOrPlay: direct play failed, reload: %{public}s', JSON.stringify(err))
+      }
+    }
+    // 兜底：重新加载当前歌曲
+    await this.changeSong()
+  }
+
   // 播放/暂停切换：按当前状态二选一
   async playOrPause() {
-    if (!this.player || this.currentSong.playList.length === 0) {
+    if (this.currentSong.playList.length === 0) {
       return
     }
     if (this.currentSong.isPlay) {
       await this.pause()
-    } else {
-      this.player.play()
-      this.currentSong.isPlay = true
-      // 同步 AVSession 播放状态（控制中心/胶囊按钮），后台时更新通知
-      await sessionManager.setAvPlayBackState(true)
-      sessionManager.publishMediaNotification(this.currentSong.name, this.currentSong.author)
-    }
-  }
-  // 播放器
-  player: media.AVPlayer | null = null
-  // 共享播放数据
-  currentSong: GlobalMusic = AppStorageV2.connect(GlobalMusic, 'SONG_KEY', () => new GlobalMusic())!
-
-  async init() {
-    if (!this.player) {
-      this.player = await media.createAVPlayer()
-    }
-    this.player.on('stateChange', (state) => {
-      if (state === 'initialized') {
-        this.player?.prepare()
-      } else if (state === 'prepared') {
-        this.player?.play()
-        this.currentSong.isPlay = true
-      } else if (state === 'completed') {
-        this.nextPlay(true)
-      }else if (state === 'released'){
-        this.currentSong.reset()
+    } else if (this.currentSong.url && this.player) {
+      // 已有资源且处于暂停态，直接续播
+      try {
+        await this.player.play()
+      } catch (err) {
+        hilog.warn(DOMAIN, 'testTag', 'resume failed, reload song: %{public}s', JSON.stringify(err))
+        await this.changeSong()
       }
-    })
-
-    // 歌曲总时长
-    this.player.on('durationUpdate', (duration) => {
-      this.currentSong.duration = duration
-
-      //把歌曲的数据存入元数据
-      sessionManager.setAvMetadata(this.currentSong.playList[this.currentSong.playIndex])
-
-    })
-    // 当前播放时间
-    this.player.on('timeUpdate', (time) => {
-      this.currentSong.time = time
-      // 更新AVSession播放进度（灵动岛进度条同步）
-      sessionManager.updatePlayState(true)
-
-    })
-
-
+    } else {
+      await this.singPlay(this.currentSong.playList[this.currentSong.playIndex])
+    }
   }
 
   // 播放歌曲
   async singPlay(song: SongItemType) {
-
-    // 申请长时任务
-    sessionManager.startBackgroundTask()
-
-    // 是否在播放列表里，some检查数组是否满足条件，只要有一个满足就返回true
     const inList = this.currentSong.playList.some(item => item.id === song.id)
 
     if (inList) {
-      // 在列表里，是否正在播放，是就继续播放，不是就切歌
-      if (this.currentSong.url === song.url) {
-        // 继续播放
-        this.player?.play()
-        // 更新播放状态为 播放
-        this.currentSong.isPlay = true
-        // 更新AVSession播放状态（灵动岛同步）和通知
-        await sessionManager.setAvPlayBackState(true)
-        sessionManager.publishMediaNotification(this.currentSong.name, this.currentSong.author)
-      } else {
-        // 切换歌曲
-        this.currentSong.playIndex = this.currentSong.playList.findIndex(item => item.id === song.id)
-        // 切换歌曲
-        this.changeSong()
+      if (this.currentSong.url === song.url && this.player) {
+        // 同一首歌，继续播放（状态同步由 stateChange('playing') 回调处理）
+        try {
+          await this.player.play()
+          return
+        } catch (err) {
+          hilog.warn(DOMAIN, 'testTag', 'replay failed, reload song: %{public}s', JSON.stringify(err))
+        }
       }
-
+      const index = this.currentSong.playList.findIndex(item => item.id === song.id)
+      this.currentSong.playIndex = index >= 0 ? index : 0
+      await this.changeSong()
     } else {
-      // 不在播放列表里，添加到播放列表，切歌播放
+      // 不在播放列表里，添加到列表开头并播放
       this.currentSong.playList.unshift(song)
-      this.currentSong.playIndex = 0 // 重置播放索引为数组刚刚加进来的第一个
-
-      // 切歌播放
-      this.changeSong()
-
+      this.currentSong.playIndex = 0
+      await this.changeSong()
     }
-
-
   }
 
   // 歌曲进度跳转
   seekPlay(value: number) {
-    this.player?.seek(value)
+    try {
+      this.player?.seek(value)
+    } catch (err) {
+      hilog.warn(DOMAIN, 'testTag', 'seek failed: %{public}s', JSON.stringify(err))
+    }
   }
 
-  // 切换歌曲 , 使用async await
+  // 切换歌曲：重置播放器 → 更新状态 → 加载资源（stateChange 回调会自动 prepare/play）
   async changeSong() {
-    await this.player?.reset() // 重置播放器
+    await this.init()
+    if (!this.player || this.currentSong.playList.length === 0) {
+      hilog.warn(DOMAIN, 'testTag', 'changeSong aborted: player not ready or empty list')
+      return
+    }
+
+    const song = this.currentSong.playList[this.currentSong.playIndex]
+    if (!song) {
+      hilog.warn(DOMAIN, 'testTag', 'changeSong aborted: song undefined')
+      return
+    }
+
+    try {
+      await this.player.reset()
+    } catch (err) {
+      hilog.warn(DOMAIN, 'testTag', 'reset failed: %{public}s', JSON.stringify(err))
+    }
+
     this.currentSong.time = 0
     this.currentSong.duration = 0
-    this.currentSong.img = this.currentSong.playList[this.currentSong.playIndex].img
-    this.currentSong.name = this.currentSong.playList[this.currentSong.playIndex].name
-    this.currentSong.author = this.currentSong.playList[this.currentSong.playIndex].author
-    this.currentSong.url = this.currentSong.playList[this.currentSong.playIndex].url
-    // 加载歌词数据
-    this.currentSong.lyrics = getLyricBySongName(this.currentSong.name)
-    // 激活AVSession并更新媒体信息（通知栏显示）
-    sessionManager.activateAndUpdateMedia(this.currentSong.name, this.currentSong.author)
-    // 发布媒体通知
-    sessionManager.publishMediaNotification(this.currentSong.name, this.currentSong.author)
-    // 设置播放资源
-    this.player!.url = this.currentSong.url
-    sessionManager.setAvMetadata(this.currentSong.playList[this.currentSong.playIndex])
+    this.currentSong.img = song.img
+    this.currentSong.name = song.name
+    this.currentSong.author = song.author
+    this.currentSong.url = song.url
+    this.currentSong.lyrics = getLyricBySongName(song.name)
+    this.currentSong.isPlay = false
 
+    // 记录播放历史（去重 + 按时间倒序 TopN），由 PreferencesService 负责落盘
+    preferencesService.recordPlay(song.id)
+
+    // 通知观察者：切歌
+    this.observer?.onSongChanged(song)
+
+    try {
+      // 设置播放资源后，stateChange('initialized') 会自动 prepare → play
+      this.player.url = song.url
+      hilog.info(DOMAIN, 'testTag', 'loading song: %{public}s', song.url)
+    } catch (err) {
+      hilog.error(DOMAIN, 'testTag', 'set url failed: %{public}s', JSON.stringify(err))
+      this.currentSong.isPlay = false
+    }
   }
 
   // 暂停
   async pause() {
-    this.player?.pause()
-    this.currentSong.isPlay = false
-    // 更新AVSession播放状态为暂停（灵动岛会同步更新）
-    await sessionManager.setAvPlayBackState(false)
-    // 后台时更新通知显示"已暂停"
-    sessionManager.publishMediaNotification(this.currentSong.name, this.currentSong.author, false)
+    try {
+      await this.player?.pause()
+    } catch (err) {
+      hilog.warn(DOMAIN, 'testTag', 'pause failed: %{public}s', JSON.stringify(err))
+    }
+    // 状态同步由 stateChange('paused') 回调统一处理；此处兜底确保 UI 立即响应
+    if (this.currentSong.isPlay) {
+      this.currentSong.isPlay = false
+      this.observer?.onPlayStateChanged(false)
+    }
   }
 
   // 上一首
   prevPlay() {
-    // 随机播放
+    if (this.currentSong.playList.length === 0) {
+      return
+    }
     if (this.currentSong.playMode === 'random') {
       this.currentSong.playIndex = Math.floor(Math.random() * this.currentSong.playList.length)
     } else {
-      // 顺序播放
-      this.currentSong.playIndex-- // 索引在数组里往上（左）移一位
-      if (this.currentSong.playIndex < 0) { // 如果索引小于0
-        // 当前播放的是播放列表第一首的时候点击上一曲，跳到最后一首
+      this.currentSong.playIndex--
+      if (this.currentSong.playIndex < 0) {
         this.currentSong.playIndex = this.currentSong.playList.length - 1
-        // 播放索引改为播放列表最后一首歌
       }
     }
     this.singPlay(this.currentSong.playList[this.currentSong.playIndex])
@@ -156,20 +266,19 @@ class AvPlayerManager {
 
   // 下一首
   nextPlay(autoNextPlay: boolean) {
-    // 模式1：单曲循环 且是自动播放的， 索引不变
+    if (this.currentSong.playList.length === 0) {
+      return
+    }
     if (this.currentSong.playMode === 'repeat' && autoNextPlay) {
-
-    } else if (this.currentSong.playMode === 'random') { // 模式2：随机播放，随机索引
+      // 单曲循环：索引不变，重新播放
+    } else if (this.currentSong.playMode === 'random') {
       this.currentSong.playIndex = Math.floor(Math.random() * this.currentSong.playList.length)
-
-    } else { // 模式3：顺序播放
-      this.currentSong.playIndex++ // 索引往后挪一位
-      // 如果当前播放索引大于等于播放列表的长度（播放列表最后一首）
+    } else {
+      this.currentSong.playIndex++
       if (this.currentSong.playIndex >= this.currentSong.playList.length) {
         this.currentSong.playIndex = 0
       }
     }
-
     this.singPlay(this.currentSong.playList[this.currentSong.playIndex])
   }
 
@@ -178,60 +287,50 @@ class AvPlayerManager {
     if (songList.length === 0) {
       return
     }
-
-    // 申请长时任务
-    sessionManager.startBackgroundTask()
-
-    // 清空当前播放列表
     this.currentSong.playList = [...songList]
     this.currentSong.playIndex = 0
-
-    // 切歌播放第一首
-    this.changeSong()
+    await this.changeSong()
   }
 
   // 移除歌曲
   removeSong(index: number) {
-    if (index === this.currentSong.playIndex) { // 如果是当前播放的歌曲
-      if (this.currentSong.playList.length > 1) { // 如果播放列表有多首歌
-        this.currentSong.playList.splice(index, 1) // splice(删除的索引，删除的个数)
-        // 播放索引大于等于了播放列表的长度，跳回第一首
+    if (index < 0 || index >= this.currentSong.playList.length) {
+      return
+    }
+    if (index === this.currentSong.playIndex) {
+      if (this.currentSong.playList.length > 1) {
+        this.currentSong.playList.splice(index, 1)
         if (this.currentSong.playIndex >= this.currentSong.playList.length) {
           this.currentSong.playIndex = 0
         }
-        // 播放歌曲
         this.singPlay(this.currentSong.playList[this.currentSong.playIndex])
-
-
       } else {
-        // 播放列表只有一首歌
-        this.player?.reset()
-        // 取消通知
-        sessionManager.cancelMediaNotification()
-        // 停用AVSession
-        sessionManager.deactivateSession()
-        // 重置全局歌曲数据
+        try {
+          this.player?.reset()
+        } catch (err) {
+          hilog.warn(DOMAIN, 'testTag', 'reset failed: %{public}s', JSON.stringify(err))
+        }
+        this.observer?.onPlayStateChanged(false)
         this.currentSong.reset()
-
       }
-
     } else {
-      // 移除的不是正在播放的歌曲
       if (index < this.currentSong.playIndex) {
-        // 要移除的歌曲在播放的歌曲之前
         this.currentSong.playIndex--
       }
-
-      // 从播放列表里移除
       this.currentSong.playList.splice(index, 1)
-
     }
-
   }
 
   // 释放播放器
-  async release(){
-    await this.player?.release()
+  async release() {
+    try {
+      await this.player?.release()
+    } catch (err) {
+      hilog.warn(DOMAIN, 'testTag', 'release failed: %{public}s', JSON.stringify(err))
+    }
+    this.player = null
+    this.isInitialized = false
+    this.initPromise = null
   }
 
 }

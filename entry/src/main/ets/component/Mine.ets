@@ -1,185 +1,246 @@
 import { songs } from '../models/songData'
 import { SongItemType } from '../models/music'
-import { AppStorageV2, promptAction } from '@kit.ArkUI'
+import { AppStorageV2 } from '@kit.ArkUI'
 import { playerManager } from '../utils/AvPlayerManager'
-import { GlobalMusic } from '../models/globalMusic'
+import { PlayerState, getPlayerState } from '../models/PlayerState'
+import { formatCount as formatCountText } from '../utils/Formatter'
+import { toast } from '../utils/Toast'
+import { resolveContext } from '../utils/ContextHelper'
+import {
+  UserStats,
+  QuickEntry,
+  PlaylistItem,
+  ContentTab,
+  DEFAULT_USER_STATS,
+  QUICK_ENTRIES,
+  CONTENT_TABS,
+  createPlaylists,
+  createCreatedPlaylists,
+  createFavPlaylists
+} from '../models/MineModels'
+import {
+  HistoryStore,
+  LikedStore,
+  PlaylistStore,
+  SettingsStore,
+  findSongsByIds,
+  getHistoryStore,
+  getLikedStore,
+  getPlaylistStore,
+  getSettingsStore,
+  preferencesService
+} from '../models/UserSettings'
 
-// 用户统计数据接口
-interface UserStats {
-  follows: number
-  fans: number
-  level: number
-  hours: number
-}
-
-// 快捷入口接口
-interface QuickEntry {
-  icon: string
-  label: string
-}
-
-// 歌单列表项接口
-interface PlaylistItem {
-  name: string
-  count: number
-  coverImg: string
-  songs: SongItemType[]    // 歌单内的歌曲列表
-  isLiked?: boolean
-  isNew?: boolean
-  isImport?: boolean
-  showPin?: boolean
-  playCount?: number
-  isRecent?: boolean       // 是否"最近播放"入口
-  isLocal?: boolean        // 是否"本地下载"入口
-}
-
-// 内容Tab接口
-interface ContentTab {
-  label: string
-}
-
-@Component
+@ComponentV2
 export struct Mine {
-  @State userStats: UserStats = {
-    follows: 1,
-    fans: 1,
-    level: 3,
-    hours: 3
-  }
+  @Local userStats: UserStats = DEFAULT_USER_STATS
 
-  @State nickname: string = '爱丁堡随性春卷'
-  @State badgeCount: number = 3
-  @State showBadgePanel: boolean = false  // 徽章面板
-  @State currentTab: number = 0
-  @State scrollY: number = 0
-  @State pressedRow: string = ''  // 当前按压的歌单行名称
-  @State isRefreshing: boolean = false  // 下拉刷新状态
-  @State imageLoadStatus: Record<string, boolean> = {}  // 图片加载状态
-  @State avatarScale: number = 1  // 头像缩放动画
-  @State avatarOpacity: number = 1  // 头像透明度动画
-  @State isEditProfileOpen: boolean = false  // 编辑资料弹窗
-  @State editNickname: string = ''  // 编辑中的昵称
-  @State isSortMode: boolean = false  // 歌单排序模式
-  @State headerHeight: number = 260  // 头部区域动态高度
+  // 用户偏好（昵称等，持久化在 PreferencesService）
+  settings: SettingsStore = getSettingsStore()
+  // 全局喜欢列表（与播放页红心共用）
+  likedStore: LikedStore = getLikedStore()
+  // 全局播放历史（最近播放数据源）
+  historyStore: HistoryStore = getHistoryStore()
+  // 歌单变更广播（其他页面「加入歌单」后自动刷新）
+  playlistStore: PlaylistStore = getPlaylistStore()
+  @Local playlistRevision: number = 0
+
+  @Local badgeCount: number = 3
+  @Local showBadgePanel: boolean = false  // 徽章面板
+  @Local currentTab: number = 0
+  @Local scrollY: number = 0
+  @Local pressedRow: string = ''  // 当前按压的歌单行名称
+  @Local isRefreshing: boolean = false  // 下拉刷新状态
+  @Local imageLoadStatus: Record<string, boolean> = {}  // 图片加载状态
+  @Local avatarScale: number = 1  // 头像缩放动画
+  @Local avatarOpacity: number = 1  // 头像透明度动画
+  @Local isEditProfileOpen: boolean = false  // 编辑资料弹窗
+  @Local editNickname: string = ''  // 编辑中的昵称
+  @Local isSortMode: boolean = false  // 歌单排序模式
+  @Local headerHeight: number = 260  // 头部区域动态高度
+
+  // 歌单名称输入弹窗（新建 / 重命名）
+  @Local isPlaylistDialogOpen: boolean = false
+  @Local playlistDialogTitle: string = ''
+  @Local playlistDialogInput: string = ''
+  private playlistDialogConfirm: ((name: string) => void) | null = null
 
   // 歌曲列表面板状态
-  @State isSongPanelOpen: boolean = false
-  @State currentPanelTitle: string = ''
-  @State currentPanelSongs: SongItemType[] = []
+  @Local isSongPanelOpen: boolean = false
+  @Local currentPanelTitle: string = ''
+  @Local currentPanelSongs: SongItemType[] = []
 
   pathStack: NavPathStack = AppStorageV2.connect(NavPathStack, 'navStack', () => new NavPathStack())!
-  playState: GlobalMusic = AppStorageV2.connect(GlobalMusic, 'SONG_KEY', () => new GlobalMusic())!
+  playState: PlayerState = getPlayerState()
   private scroller: Scroller = new Scroller()
+  // 刷新模拟定时器 id
+  private refreshTimer: number = -1
+  // 头像点击动画定时器 id
+  private avatarTimer: number = -1
 
-  // 最近播放列表（基于全局播放历史）
+  aboutToAppear(): void {
+    // 恢复已创建的歌单（首次启动时把默认歌单落盘）
+    preferencesService.init(resolveContext(this.getUIContext()))
+      .then(() => {
+        return preferencesService.loadPlaylists(this.createdPlaylists)
+      })
+      .then((list: PlaylistItem[]) => {
+        this.createdPlaylists = list
+      })
+      .catch(() => {
+        // 读取失败保持默认数据，不影响页面
+      })
+  }
+
+  /** 其他页面修改歌单后，重新拉取磁盘数据 */
+  @Monitor('playlistStore.revision')
+  onPlaylistRevisionChange() {
+    const revision = this.playlistStore.revision
+    if (revision === this.playlistRevision) {
+      return
+    }
+    this.playlistRevision = revision
+    preferencesService.loadPlaylists(this.createdPlaylists).then((list: PlaylistItem[]) => {
+      this.createdPlaylists = list
+    })
+  }
+
+  aboutToDisappear(): void {
+    // 组件销毁时清理所有定时器，避免回调访问已释放的组件状态
+    if (this.refreshTimer !== -1) {
+      clearTimeout(this.refreshTimer)
+      this.refreshTimer = -1
+    }
+    if (this.avatarTimer !== -1) {
+      clearTimeout(this.avatarTimer)
+      this.avatarTimer = -1
+    }
+  }
+
+  // 最近播放列表（基于持久化的播放历史，去重 + 时间倒序 Top5）
   private getRecentPlayList(): SongItemType[] {
-    const list = this.playState.playList.length > 0 ? this.playState.playList : songs
+    const list = this.getRecentAllSongs()
     return list.slice(0, 5)
   }
 
-  // 最近播放完整列表
+  // 最近播放完整列表（真实历史，按时间倒序去重）
   private getRecentAllSongs(): SongItemType[] {
-    return this.playState.playList.length > 0 ? this.playState.playList : songs
+    return findSongsByIds(this.historyStore.records.map(record => record.id))
+  }
+
+  // 「我喜欢的音乐」：直接由全局喜欢 id 列表计算，与播放页红心实时同步
+  private getLikedSongs(): SongItemType[] {
+    return findSongsByIds(this.likedStore.likedSongIds)
+  }
+
+  // 打开「我喜欢的音乐」面板
+  openLikedPanel() {
+    this.openSongPanel('我喜欢的音乐', this.getLikedSongs(), '还没有喜欢的歌曲，去播放页点红心吧')
+  }
+
+  // 保存歌单列表（增 / 删 / 改 / 排序后调用）
+  private savePlaylists(): void {
+    preferencesService.persistPlaylists(this.createdPlaylists)
+  }
+
+  // 新建歌单
+  createPlaylist(name: string) {
+    const value = name.trim()
+    if (value.length === 0) {
+      toast({ message: '歌单名不能为空', duration: 1000 })
+      return
+    }
+    if (this.createdPlaylists.some(item => item.name === value)) {
+      toast({ message: '已存在同名歌单', duration: 1000 })
+      return
+    }
+    const item: PlaylistItem = {
+      id: `pl_${Date.now()}`,
+      name: value,
+      count: 0,
+      coverImg: '',
+      songs: []
+    }
+    this.createdPlaylists = [...this.createdPlaylists, item]
+    this.savePlaylists()
+    toast({ message: '歌单创建成功', duration: 1000 })
+  }
+
+  // 重命名歌单
+  renamePlaylist(target: PlaylistItem, name: string) {
+    const value = name.trim()
+    if (value.length === 0) {
+      toast({ message: '歌单名不能为空', duration: 1000 })
+      return
+    }
+    if (value === target.name) {
+      return
+    }
+    if (this.createdPlaylists.some(item => item !== target && item.name === value)) {
+      toast({ message: '已存在同名歌单', duration: 1000 })
+      return
+    }
+    target.name = value
+    this.createdPlaylists = [...this.createdPlaylists]
+    this.savePlaylists()
+    toast({ message: '重命名成功', duration: 1000 })
+  }
+
+  // 删除歌单
+  deletePlaylist(target: PlaylistItem) {
+    this.createdPlaylists = this.createdPlaylists.filter(item => item !== target)
+    this.savePlaylists()
+    toast({ message: '已删除歌单', duration: 1000 })
+  }
+
+  // 置顶 / 取消置顶（置顶项固定排在最前）
+  togglePin(target: PlaylistItem) {
+    target.showPin = !target.showPin
+    const pinned = this.createdPlaylists.filter(item => item.showPin)
+    const rest = this.createdPlaylists.filter(item => !item.showPin)
+    this.createdPlaylists = [...pinned, ...rest]
+    this.savePlaylists()
+    toast({ message: target.showPin ? '已置顶' : '已取消置顶', duration: 1000 })
+  }
+
+  // 弹出歌单名称输入框（新建 / 重命名共用）
+  openPlaylistNameDialog(title: string, initial: string, onConfirm: (name: string) => void) {
+    this.playlistDialogTitle = title
+    this.playlistDialogInput = initial
+    this.playlistDialogConfirm = onConfirm
+    this.isPlaylistDialogOpen = true
+  }
+
+  // 「最近播放」快捷入口（历史为空时提示）
+  private getQuickRecentSongs(): SongItemType[] {
+    const ids = this.historyStore.records.map(record => record.id)
+    return findSongsByIds(ids)
   }
 
   // 快捷入口数据
-  private quickEntries: QuickEntry[] = [
-    { icon: '\ue600', label: '最近' },
-    { icon: '\ue601', label: '本地' },
-    { icon: '\ue602', label: 'VIP' },
-    { icon: '\ue603', label: '装扮' },
-    { icon: '\ue604', label: '更多' },
-  ]
+  private quickEntries: QuickEntry[] = QUICK_ENTRIES
 
   // 内容Tab
-  private contentTabs: ContentTab[] = [
-    { label: '音乐' },
-    { label: '播客' },
-    { label: '笔记' },
-  ]
+  private contentTabs: ContentTab[] = CONTENT_TABS
 
-  // 歌单列表
-  @State playlists: PlaylistItem[] = [
-    {
-      name: '我喜欢的音乐',
-      count: 3,
-      coverImg: 'http://yjy-teach-oss.oss-cn-beijing.aliyuncs.com/HeimaCloudMusic/1.jpg',
-      songs: [songs[0], songs[6], songs[14]], // 画、孤独、海阔天空
-      isLiked: true
-    },
-    {
-      name: '听歌排行',
-      count: 0,
-      coverImg: '',
-      songs: [],
-      playCount: 75,
-      showPin: true
-    },
-    {
-      name: '新建歌单',
-      count: 0,
-      coverImg: '',
-      songs: [],
-      isNew: true
-    },
-    {
-      name: '导入外部歌单',
-      count: 0,
-      coverImg: '',
-      songs: [],
-      isImport: true
-    },
-  ]
+  // 歌单列表（数据定义见 models/MineModels.ets）
+  @Local playlists: PlaylistItem[] = createPlaylists()
 
   // 创建的歌单
-  @State createdPlaylists: PlaylistItem[] = [
-    {
-      name: '经典华语老歌',
-      count: 5,
-      coverImg: 'http://yjy-teach-oss.oss-cn-beijing.aliyuncs.com/HeimaCloudMusic/9.jpg',
-      songs: [songs[8], songs[11], songs[12], songs[13], songs[14]] // 倩女幽魂、一生所爱、月半小夜曲、Rolling in the Deep、海阔天空
-    },
-    {
-      name: '睡前轻音乐',
-      count: 4,
-      coverImg: 'http://yjy-teach-oss.oss-cn-beijing.aliyuncs.com/HeimaCloudMusic/2.jpg',
-      songs: [songs[0], songs[1], songs[6], songs[9]] // 画、Sweet Dreams、孤独、北京北京
-    },
-  ]
+  @Local createdPlaylists: PlaylistItem[] = createCreatedPlaylists()
 
   // 收藏的歌单
-  @State favPlaylists: PlaylistItem[] = [
-    {
-      name: '欧美热门精选',
-      count: 4,
-      coverImg: 'http://yjy-teach-oss.oss-cn-beijing.aliyuncs.com/HeimaCloudMusic/8.jpg',
-      songs: [songs[1], songs[5], songs[7], songs[13]] // Sweet Dreams、No.9、Lose Control、Rolling in the Deep
-    },
-    {
-      name: '粤语经典',
-      count: 3,
-      coverImg: 'http://yjy-teach-oss.oss-cn-beijing.aliyuncs.com/HeimaCloudMusic/13.jpg',
-      songs: [songs[8], songs[11], songs[12]] // 倩女幽魂、一生所爱、月半小夜曲
-    },
-    {
-      name: '电音派对',
-      count: 2,
-      coverImg: 'http://yjy-teach-oss.oss-cn-beijing.aliyuncs.com/HeimaCloudMusic/6.jpg',
-      songs: [songs[4], songs[5]] // 反转地球、No.9
-    },
-  ]
+  @Local favPlaylists: PlaylistItem[] = createFavPlaylists()
 
+  // 大数字格式化（实现见 utils/Formatter.ets）
   formatCount(count: number): string {
-    if (count >= 10000) {
-      return (count / 10000).toFixed(1) + '万'
-    }
-    return count.toString()
+    return formatCountText(count)
   }
 
   // 打开歌曲列表面板
-  openSongPanel(title: string, songs: SongItemType[]) {
+  openSongPanel(title: string, songs: SongItemType[], emptyTip: string = '暂无歌曲') {
     if (songs.length === 0) {
-      promptAction.showToast({ message: '暂无歌曲', duration: 1000 })
+      toast({ message: emptyTip, duration: 1200 })
       return
     }
     this.currentPanelTitle = title
@@ -214,34 +275,47 @@ export struct Mine {
   handleRefresh() {
     this.isRefreshing = true
     // 模拟刷新：更新听歌小时和听歌排行计数
-    setTimeout(() => {
+    if (this.refreshTimer !== -1) {
+      clearTimeout(this.refreshTimer)
+    }
+    this.refreshTimer = setTimeout(() => {
+      this.refreshTimer = -1
       this.userStats.hours = Math.floor(Math.random() * 10) + 1
       const playCountItem = this.playlists.find(item => item.playCount !== undefined)
       if (playCountItem && playCountItem.playCount !== undefined) {
         playCountItem.playCount = playCountItem.playCount + Math.floor(Math.random() * 5)
       }
       this.isRefreshing = false
-      promptAction.showToast({ message: '刷新成功', duration: 1000 })
+      toast({ message: '刷新成功', duration: 1000 })
     }, 1000)
   }
 
-  // 歌单排序：上移
+  // 歌单排序：上移（顺序落盘）
   movePlaylistUp(index: number) {
     if (index > 0) {
+      // 置顶项固定在顶部，不参与排序
+      if (this.createdPlaylists[index].showPin || this.createdPlaylists[index - 1].showPin) {
+        return
+      }
       const temp = this.createdPlaylists[index]
       this.createdPlaylists[index] = this.createdPlaylists[index - 1]
       this.createdPlaylists[index - 1] = temp
       this.createdPlaylists = [...this.createdPlaylists]  // 触发UI刷新
+      this.savePlaylists()
     }
   }
 
-  // 歌单排序：下移
+  // 歌单排序：下移（顺序落盘）
   movePlaylistDown(index: number) {
     if (index < this.createdPlaylists.length - 1) {
+      if (this.createdPlaylists[index].showPin || this.createdPlaylists[index + 1].showPin) {
+        return
+      }
       const temp = this.createdPlaylists[index]
       this.createdPlaylists[index] = this.createdPlaylists[index + 1]
       this.createdPlaylists[index + 1] = temp
       this.createdPlaylists = [...this.createdPlaylists]  // 触发UI刷新
+      this.savePlaylists()
     }
   }
 
@@ -254,20 +328,20 @@ export struct Mine {
       Image($r('app.media.ic_list'))
         .width(24)
         .height(24)
-        .fillColor(this.scrollY > 75 ? '#333333' : '#ffffff')
+        .fillColor(this.scrollY > 75 ? $r('app.color.nav_icon_dark') : $r('app.color.text_primary'))
         .onClick(() => {
-          promptAction.showToast({ message: '菜单', duration: 1000 })
+          toast({ message: '菜单', duration: 1000 })
         })
 
       Stack() {
         Row({ space: 6 }) {
           Text('+ 添加状态')
             .fontSize(14)
-            .fontColor(this.scrollY > 75 ? '#666666' : '#ffffff')
+            .fontColor(this.scrollY > 75 ? $r('app.color.text_disabled') : $r('app.color.text_primary'))
           Circle()
             .width(8)
             .height(8)
-            .fill('#ff3b30')
+            .fill($r('app.color.brand_primary'))
         }
       }
       .layoutWeight(1)
@@ -277,16 +351,16 @@ export struct Mine {
         Image($r('app.media.ic_search'))
           .width(22)
           .height(22)
-          .fillColor(this.scrollY > 75 ? '#333333' : '#ffffff')
+          .fillColor(this.scrollY > 75 ? $r('app.color.nav_icon_dark') : $r('app.color.text_primary'))
           .onClick(() => {
-            promptAction.showToast({ message: '搜索', duration: 1000 })
+            toast({ message: '搜索', duration: 1000 })
           })
         Image($r('app.media.ic_more'))
           .width(22)
           .height(22)
-          .fillColor(this.scrollY > 75 ? '#333333' : '#ffffff')
+          .fillColor(this.scrollY > 75 ? $r('app.color.nav_icon_dark') : $r('app.color.text_primary'))
           .onClick(() => {
-            promptAction.showToast({ message: '设置', duration: 1000 })
+            toast({ message: '设置', duration: 1000 })
           })
       }
     }
@@ -305,14 +379,14 @@ export struct Mine {
       Text(value)
         .fontSize(16)
         .fontWeight(FontWeight.Bold)
-        .fontColor('#ffffff')
+        .fontColor($r('app.color.text_primary'))
       Text(label)
         .fontSize(11)
-        .fontColor('#cccccc')
+        .fontColor($r('app.color.text_secondary'))
     }
     .layoutWeight(1)
     .onClick(() => {
-      promptAction.showToast({ message: `${label}: ${value}`, duration: 1000 })
+      toast({ message: `${label}: ${value}`, duration: 1000 })
     })
   }
 
@@ -325,48 +399,48 @@ export struct Mine {
           Image($r('app.media.ic_recommend'))
             .width(28)
             .height(28)
-            .fillColor('#ffcccccc')
+            .fillColor($r('app.color.text_secondary'))
         } else if (entry.label === '本地') {
           Image($r('app.media.ic_find'))
             .width(28)
             .height(28)
-            .fillColor('#ffcccccc')
+            .fillColor($r('app.color.text_secondary'))
         } else if (entry.label === 'VIP') {
           Image($r('app.media.ic_moment'))
             .width(28)
             .height(28)
-            .fillColor('#ffd4a74a')
+            .fillColor($r('app.color.accent_gold_soft'))
         } else if (entry.label === '装扮') {
           Image($r('app.media.ic_code'))
             .width(28)
             .height(28)
-            .fillColor('#ffcccccc')
+            .fillColor($r('app.color.text_secondary'))
         } else {
           Image($r('app.media.ic_more'))
             .width(28)
             .height(28)
-            .fillColor('#ffcccccc')
+            .fillColor($r('app.color.text_secondary'))
         }
       }
       .width(48)
       .height(48)
       .borderRadius(24)
-      .backgroundColor('#2a2a2a')
+      .backgroundColor($r('app.color.bg_elevated'))
       .justifyContent(FlexAlign.Center)
 
       Text(entry.label)
         .fontSize(12)
-        .fontColor('#bbbbbb')
+        .fontColor($r('app.color.text_tertiary'))
     }
     .layoutWeight(1)
     .onClick(() => {
       if (entry.label === '最近') {
-        this.openSongPanel('最近播放', this.getRecentAllSongs())
+        this.openSongPanel('最近播放', this.getQuickRecentSongs())
       } else if (entry.label === '本地') {
         // 本地歌单 = 导入发现页所有歌曲
         this.openSongPanel('本地下载', [...songs])
       } else {
-        promptAction.showToast({ message: `进入: ${entry.label}`, duration: 1000 })
+        toast({ message: `进入: ${entry.label}`, duration: 1000 })
       }
     })
   }
@@ -378,14 +452,14 @@ export struct Mine {
       Text(tab.label)
         .fontSize(16)
         .fontWeight(this.currentTab === index ? FontWeight.Bold : FontWeight.Normal)
-        .fontColor(this.currentTab === index ? '#ffffff' : '#888888')
+        .fontColor(this.currentTab === index ? $r('app.color.text_primary') : $r('app.color.text_quaternary'))
         .animation({ duration: 200, curve: Curve.EaseInOut })
       // Tab指示器 - 使用显式动画实现平滑过渡
       Column()
         .width(20)
         .height(3)
         .borderRadius(1.5)
-        .backgroundColor(this.currentTab === index ? '#ec4141' : Color.Transparent)
+        .backgroundColor(this.currentTab === index ? $r('app.color.brand_primary') : Color.Transparent)
         .animation({ duration: 300, curve: Curve.EaseInOut })
     }
     .padding({ left: 16, right: 16 })
@@ -404,12 +478,12 @@ export struct Mine {
           Image(item.isNew ? $r('app.media.ic_code') : $r('app.media.ic_find'))
             .width(24)
             .height(24)
-            .fillColor('#888888')
+            .fillColor($r('app.color.text_quaternary'))
         }
         .width(48)
         .height(48)
         .borderRadius(8)
-        .border({ width: 1, color: '#3a3a3a', style: BorderStyle.Dashed })
+        .border({ width: 1, color: $r('app.color.bg_elevated_hover'), style: BorderStyle.Dashed })
         .justifyContent(FlexAlign.Center)
       } else if (item.isLiked) {
         Column() {
@@ -420,19 +494,19 @@ export struct Mine {
         .width(48)
         .height(48)
         .borderRadius(8)
-        .backgroundColor('#ec4141')
+        .backgroundColor($r('app.color.brand_primary'))
         .justifyContent(FlexAlign.Center)
       } else if (item.playCount !== undefined) {
         Column() {
           Image($r('app.media.ic_moment'))
             .width(24)
             .height(24)
-            .fillColor('#bbbbbb')
+            .fillColor($r('app.color.text_tertiary'))
         }
         .width(48)
         .height(48)
         .borderRadius(8)
-        .backgroundColor('#2a2a2a')
+        .backgroundColor($r('app.color.bg_elevated'))
         .justifyContent(FlexAlign.Center)
       } else {
         Stack() {
@@ -441,12 +515,12 @@ export struct Mine {
             .width(48)
             .height(48)
             .borderRadius(8)
-            .backgroundColor('#2a2a2a')
+            .backgroundColor($r('app.color.bg_elevated'))
             .justifyContent(FlexAlign.Center)
           Image($r('app.media.ic_moment'))
             .width(20)
             .height(20)
-            .fillColor('#444444')
+            .fillColor($r('app.color.icon_muted'))
             .visibility(!(this.imageLoadStatus[item.coverImg] ?? false) ? Visibility.Visible : Visibility.Hidden)
 
           Image(item.coverImg)
@@ -469,7 +543,7 @@ export struct Mine {
         Row({ space: 6 }) {
           Text(item.name)
             .fontSize(15)
-            .fontColor('#ffffff')
+            .fontColor($r('app.color.text_primary'))
             .fontWeight(FontWeight.Medium)
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -478,7 +552,7 @@ export struct Mine {
               .fontSize(10)
               .fontColor(Color.White)
               .padding({ left: 4, right: 4, top: 1, bottom: 1 })
-              .backgroundColor('#ec4141')
+              .backgroundColor($r('app.color.brand_primary'))
               .borderRadius(3)
           }
         }
@@ -487,11 +561,16 @@ export struct Mine {
           if (item.playCount !== undefined) {
             Text(`累计听歌${item.playCount}首`)
               .fontSize(12)
-              .fontColor('#888888')
+              .fontColor($r('app.color.text_quaternary'))
+          } else if (item.isLiked) {
+            // 喜欢数量实时跟随全局喜欢列表
+            Text(`${this.likedStore.likedSongIds.length}首`)
+              .fontSize(12)
+              .fontColor($r('app.color.text_quaternary'))
           } else if (item.count > 0) {
             Text(`${item.count}首`)
               .fontSize(12)
-              .fontColor('#888888')
+              .fontColor($r('app.color.text_quaternary'))
           }
         }
       }
@@ -500,37 +579,43 @@ export struct Mine {
 
       // 右侧操作区
       Row({ space: 12 }) {
-        if (item.showPin) {
+        if (item.showPin && this.canManage(item)) {
           Text('不置顶')
             .fontSize(12)
-            .fontColor('#888888')
+            .fontColor($r('app.color.text_quaternary'))
             .onClick(() => {
-              promptAction.showToast({ message: '取消置顶', duration: 1000 })
+              this.togglePin(item)
             })
         }
         if (!item.isNew && !item.isImport) {
           Image($r('app.media.ic_more'))
             .width(18)
             .height(18)
-            .fillColor('#555555')
+            .fillColor($r('app.color.text_faint'))
         }
       }
     }
     .width('100%')
     .padding({ left: 16, right: 16, top: 12, bottom: 12 })
-    .backgroundColor(this.pressedRow === item.name ? 'rgba(255,255,255,0.05)' : Color.Transparent)
+    .backgroundColor(this.pressedRow === item.name ? $r('app.color.overlay_light') : Color.Transparent)
     .animation({ duration: 150 })
     .onClick(() => {
       if (item.isNew) {
-        promptAction.showToast({ message: '新建歌单', duration: 1000 })
+        // 新建歌单：输入名称后真正创建并落盘
+        this.openPlaylistNameDialog('新建歌单', '', (name: string) => {
+          this.createPlaylist(name)
+        })
       } else if (item.isImport) {
         this.openSongPanel('导入外部歌单', [...songs])
+      } else if (item.isLiked) {
+        // 我喜欢的音乐：与播放页红心共用同一份数据
+        this.openLikedPanel()
       } else if (item.playCount !== undefined) {
         this.openSongPanel('听歌排行', this.getRecentAllSongs())
       } else if (item.songs && item.songs.length > 0) {
         this.openSongPanel(item.name, item.songs)
       } else {
-        promptAction.showToast({ message: `${item.name}暂无歌曲`, duration: 1000 })
+        toast({ message: `${item.name}暂无歌曲`, duration: 1000 })
       }
     })
     .onTouch((event: TouchEvent) => {
@@ -543,24 +628,37 @@ export struct Mine {
     .bindContextMenu(this.playlistContextMenu(item), ResponseType.LongPress)
   }
 
-  // 歌单长按菜单
+  // 歌单长按菜单（仅用户创建的歌单可管理，修改会真正落盘）
   @Builder
   playlistContextMenu(item: PlaylistItem) {
     Menu() {
-      MenuItem({ content: item.showPin ? '取消置顶' : '置顶' })
-        .onClick(() => {
-          item.showPin = !item.showPin
-          promptAction.showToast({ message: item.showPin ? '已置顶' : '已取消置顶', duration: 1000 })
-        })
-      MenuItem({ content: '重命名' })
-        .onClick(() => {
-          promptAction.showToast({ message: '重命名功能', duration: 1000 })
-        })
-      MenuItem({ content: '删除' })
-        .onClick(() => {
-          promptAction.showToast({ message: '删除功能', duration: 1000 })
-        })
+      if (this.canManage(item)) {
+        MenuItem({ content: item.showPin ? '取消置顶' : '置顶' })
+          .onClick(() => {
+            this.togglePin(item)
+          })
+        MenuItem({ content: '重命名' })
+          .onClick(() => {
+            this.openPlaylistNameDialog('重命名歌单', item.name, (name: string) => {
+              this.renamePlaylist(item, name)
+            })
+          })
+        MenuItem({ content: '删除' })
+          .onClick(() => {
+            this.deletePlaylist(item)
+          })
+      } else {
+        MenuItem({ content: '查看歌曲' })
+          .onClick(() => {
+            this.openSongPanel(item.name, item.songs)
+          })
+      }
     }
+  }
+
+  // 是否可管理（置顶/重命名/删除）：只有用户创建且有 id 的歌单
+  private canManage(item: PlaylistItem): boolean {
+    return !!item.id && this.createdPlaylists.includes(item)
   }
 
   // 区域标题栏
@@ -570,21 +668,38 @@ export struct Mine {
       Text(title)
         .fontSize(15)
         .fontWeight(FontWeight.Bold)
-        .fontColor('#ffffff')
+        .fontColor($r('app.color.text_primary'))
       Blank()
       Row({ space: 4 }) {
         Image($r('app.media.ic_share'))
           .width(18)
           .height(18)
-          .fillColor('#888888')
+          .fillColor($r('app.color.text_quaternary'))
         Image($r('app.media.ic_more'))
           .width(18)
           .height(18)
-          .fillColor('#888888')
+          .fillColor($r('app.color.text_quaternary'))
       }
     }
     .width('100%')
     .padding({ left: 16, right: 16, top: 16, bottom: 8 })
+  }
+
+  // 最近播放空状态（无播放历史时展示）
+  @Builder
+  recentEmptyPlaceholder() {
+    Column({ space: 6 }) {
+      Text('还没有播放记录')
+        .fontSize(13)
+        .fontColor($r('app.color.text_disabled'))
+      Text('去发现页听几首歌吧~')
+        .fontSize(11)
+        .fontColor($r('app.color.text_faint'))
+    }
+    .height(90)
+    .padding({ left: 4, right: 20 })
+    .justifyContent(FlexAlign.Center)
+    .alignItems(HorizontalAlign.Start)
   }
 
   // 最近播放歌曲项（横向滚动）
@@ -597,12 +712,12 @@ export struct Mine {
           .width(55)
           .height(55)
           .borderRadius(6)
-          .backgroundColor('#2a2a2a')
+          .backgroundColor($r('app.color.bg_elevated'))
           .justifyContent(FlexAlign.Center)
         Image($r('app.media.ic_moment'))
           .width(20)
           .height(20)
-          .fillColor('#444444')
+          .fillColor($r('app.color.icon_muted'))
           .visibility(!(this.imageLoadStatus[song.img] ?? false) ? Visibility.Visible : Visibility.Hidden)
 
         Image(song.img)
@@ -623,7 +738,7 @@ export struct Mine {
             .width(55)
             .height(55)
             .borderRadius(6)
-            .backgroundColor('rgba(0,0,0,0.4)')
+            .backgroundColor($r('app.color.overlay_dark_40'))
             .justifyContent(FlexAlign.Center)
           Image($r('app.media.wave'))
             .width(22)
@@ -632,7 +747,7 @@ export struct Mine {
       }
       Text(song.name)
         .fontSize(11)
-        .fontColor('#bbbbbb')
+        .fontColor($r('app.color.text_tertiary'))
         .maxLines(1)
         .textOverflow({ overflow: TextOverflow.Ellipsis })
         .width(55)
@@ -661,7 +776,7 @@ export struct Mine {
       Column()
         .width('100%')
         .height('100%')
-        .backgroundColor('rgba(0,0,0,0.5)')
+        .backgroundColor($r('app.color.overlay_dark_50'))
         .onClick(() => {
           this.closeSongPanel()
         })
@@ -673,14 +788,14 @@ export struct Mine {
           Text(this.currentPanelTitle)
             .fontSize(18)
             .fontWeight(FontWeight.Bold)
-            .fontColor('#ffffff')
+            .fontColor($r('app.color.text_primary'))
             .layoutWeight(1)
 
           // 播放全部按钮
           Button('播放全部')
             .fontSize(13)
-            .fontColor('#ffffff')
-            .backgroundColor('#ec4141')
+            .fontColor($r('app.color.text_primary'))
+            .backgroundColor($r('app.color.brand_primary'))
             .borderRadius(16)
             .height(32)
             .padding({ left: 14, right: 14 })
@@ -691,7 +806,7 @@ export struct Mine {
           Image($r('app.media.ic_close'))
             .width(22)
             .height(22)
-            .fillColor('#888888')
+            .fillColor($r('app.color.text_quaternary'))
             .margin({ left: 12 })
             .onClick(() => {
               this.closeSongPanel()
@@ -699,7 +814,7 @@ export struct Mine {
         }
         .width('100%')
         .padding({ left: 16, right: 16, top: 16, bottom: 12 })
-        .border({ width: { bottom: 0.5 }, color: '#2a2a2a' })
+        .border({ width: { bottom: 0.5 }, color: $r('app.color.bg_elevated') })
 
         // 歌曲列表
         List({ space: 0 }) {
@@ -709,7 +824,7 @@ export struct Mine {
                 // 序号
                 Text((index + 1).toString().padStart(2, '0'))
                   .fontSize(16)
-                  .fontColor(this.playState.url === song.url && this.playState.isPlay ? '#ec4141' : '#888888')
+                  .fontColor(this.playState.url === song.url && this.playState.isPlay ? $r('app.color.brand_primary') : $r('app.color.text_quaternary'))
                   .fontWeight(this.playState.url === song.url && this.playState.isPlay ? FontWeight.Bold : FontWeight.Normal)
                   .width(30)
 
@@ -720,12 +835,12 @@ export struct Mine {
                     .width(44)
                     .height(44)
                     .borderRadius(6)
-                    .backgroundColor('#2a2a2a')
+                    .backgroundColor($r('app.color.bg_elevated'))
                     .justifyContent(FlexAlign.Center)
                   Image($r('app.media.ic_moment'))
                     .width(18)
                     .height(18)
-                    .fillColor('#444444')
+                    .fillColor($r('app.color.icon_muted'))
                     .visibility(!(this.imageLoadStatus[song.img] ?? false) ? Visibility.Visible : Visibility.Hidden)
 
                   Image(song.img)
@@ -746,7 +861,7 @@ export struct Mine {
                       .width(44)
                       .height(44)
                       .borderRadius(6)
-                      .backgroundColor('rgba(0,0,0,0.3)')
+                      .backgroundColor($r('app.color.overlay_dark_30'))
                       .justifyContent(FlexAlign.Center)
                     Image($r('app.media.wave'))
                       .width(18)
@@ -758,13 +873,13 @@ export struct Mine {
                 Column({ space: 4 }) {
                   Text(song.name)
                     .fontSize(15)
-                    .fontColor(this.playState.url === song.url && this.playState.isPlay ? '#ec4141' : '#ffffff')
+                    .fontColor(this.playState.url === song.url && this.playState.isPlay ? $r('app.color.brand_primary') : $r('app.color.text_primary'))
                     .fontWeight(FontWeight.Medium)
                     .maxLines(1)
                     .textOverflow({ overflow: TextOverflow.Ellipsis })
                   Text(song.author)
                     .fontSize(12)
-                    .fontColor('#888888')
+                    .fontColor($r('app.color.text_quaternary'))
                     .maxLines(1)
                     .textOverflow({ overflow: TextOverflow.Ellipsis })
                 }
@@ -775,11 +890,11 @@ export struct Mine {
                 Image($r('app.media.ic_more'))
                   .width(18)
                   .height(18)
-                  .fillColor('#555555')
+                  .fillColor($r('app.color.text_faint'))
               }
               .width('100%')
               .padding({ left: 16, right: 16, top: 10, bottom: 10 })
-              .backgroundColor(this.pressedRow === `panel_${index}` ? 'rgba(255,255,255,0.05)' : Color.Transparent)
+              .backgroundColor(this.pressedRow === `panel_${index}` ? $r('app.color.overlay_light') : Color.Transparent)
               .animation({ duration: 150 })
               .onClick(() => {
                 this.playSong(song)
@@ -806,7 +921,7 @@ export struct Mine {
       }
       .width('100%')
       .height('70%')
-      .backgroundColor('#1e1e1e')
+      .backgroundColor($r('app.color.bg_panel'))
       .borderRadius({ topLeft: 16, topRight: 16 })
       .transition(TransitionEffect.translate({ y: 600 }).animation({ duration: 300, curve: Curve.EaseOut }))
     }
@@ -823,7 +938,7 @@ export struct Mine {
       Column()
         .width('100%')
         .height('100%')
-        .backgroundColor('rgba(0,0,0,0.5)')
+        .backgroundColor($r('app.color.overlay_dark_50'))
         .onClick(() => {
           this.isEditProfileOpen = false
         })
@@ -832,21 +947,21 @@ export struct Mine {
         Text('编辑资料')
           .fontSize(20)
           .fontWeight(FontWeight.Bold)
-          .fontColor('#ffffff')
+          .fontColor($r('app.color.text_primary'))
 
         // 头像预览
         Image($r('app.media.QQp5'))
           .width(80)
           .height(80)
           .borderRadius(40)
-          .border({ width: 3, color: '#ffffff' })
+          .border({ width: 3, color: $r('app.color.text_primary') })
 
         // 昵称编辑
         TextInput({ text: $$this.editNickname, placeholder: '请输入昵称' })
           .fontSize(16)
-          .fontColor('#ffffff')
-          .placeholderColor('#888888')
-          .backgroundColor('#2a2a2a')
+          .fontColor($r('app.color.text_primary'))
+          .placeholderColor($r('app.color.text_quaternary'))
+          .backgroundColor($r('app.color.bg_elevated'))
           .borderRadius(8)
           .padding({ left: 12, right: 12 })
           .height(44)
@@ -856,8 +971,8 @@ export struct Mine {
         Row({ space: 16 }) {
           Button('取消')
             .fontSize(15)
-            .fontColor('#ffffff')
-            .backgroundColor('#3a3a3a')
+            .fontColor($r('app.color.text_primary'))
+            .backgroundColor($r('app.color.bg_elevated_hover'))
             .borderRadius(20)
             .layoutWeight(1)
             .height(40)
@@ -867,24 +982,102 @@ export struct Mine {
 
           Button('保存')
             .fontSize(15)
-            .fontColor('#ffffff')
-            .backgroundColor('#ec4141')
+            .fontColor($r('app.color.text_primary'))
+            .backgroundColor($r('app.color.brand_primary'))
             .borderRadius(20)
             .layoutWeight(1)
             .height(40)
             .onClick(() => {
-              if (this.editNickname.trim().length > 0) {
-                this.nickname = this.editNickname.trim()
+              if (this.editNickname.trim().length === 0) {
+                toast({ message: '昵称不能为空', duration: 1000 })
+                return
               }
+              // 昵称落盘，重启后保留
+              preferencesService.setNickname(this.editNickname)
               this.isEditProfileOpen = false
-              promptAction.showToast({ message: '保存成功', duration: 1000 })
+              toast({ message: '保存成功', duration: 1000 })
             })
         }
         .width('100%')
       }
       .width('80%')
       .padding(24)
-      .backgroundColor('#1e1e1e')
+      .backgroundColor($r('app.color.bg_panel'))
+      .borderRadius(16)
+    }
+    .width('100%')
+    .height('100%')
+    .position({ x: 0, y: 0 })
+    .transition(TransitionEffect.OPACITY.animation({ duration: 300 }))
+  }
+
+  // ========== 歌单名称输入弹窗（新建 / 重命名） ==========
+  @Builder
+  playlistNameDialog() {
+    Stack({ alignContent: Alignment.Center }) {
+      Column()
+        .width('100%')
+        .height('100%')
+        .backgroundColor($r('app.color.overlay_dark_50'))
+        .onClick(() => {
+          this.isPlaylistDialogOpen = false
+        })
+
+      Column({ space: 20 }) {
+        Text(this.playlistDialogTitle)
+          .fontSize(20)
+          .fontWeight(FontWeight.Bold)
+          .fontColor($r('app.color.text_primary'))
+
+        TextInput({ text: $$this.playlistDialogInput, placeholder: '请输入歌单名称' })
+          .fontSize(16)
+          .fontColor($r('app.color.text_primary'))
+          .placeholderColor($r('app.color.text_quaternary'))
+          .backgroundColor($r('app.color.bg_elevated'))
+          .borderRadius(8)
+          .padding({ left: 12, right: 12 })
+          .height(44)
+          .width('100%')
+          .maxLength(30)
+
+        Row({ space: 16 }) {
+          Button('取消')
+            .fontSize(15)
+            .fontColor($r('app.color.text_primary'))
+            .backgroundColor($r('app.color.bg_elevated_hover'))
+            .borderRadius(20)
+            .layoutWeight(1)
+            .height(40)
+            .onClick(() => {
+              this.isPlaylistDialogOpen = false
+            })
+
+          Button('确定')
+            .fontSize(15)
+            .fontColor($r('app.color.text_primary'))
+            .backgroundColor($r('app.color.brand_primary'))
+            .borderRadius(20)
+            .layoutWeight(1)
+            .height(40)
+            .onClick(() => {
+              const name = this.playlistDialogInput.trim()
+              if (name.length === 0) {
+                toast({ message: '歌单名不能为空', duration: 1000 })
+                return
+              }
+              this.isPlaylistDialogOpen = false
+              const confirm = this.playlistDialogConfirm
+              this.playlistDialogConfirm = null
+              if (confirm) {
+                confirm(name)
+              }
+            })
+        }
+        .width('100%')
+      }
+      .width('80%')
+      .padding(24)
+      .backgroundColor($r('app.color.bg_panel'))
       .borderRadius(16)
     }
     .width('100%')
@@ -900,7 +1093,7 @@ export struct Mine {
       Column()
         .width('100%')
         .height('100%')
-        .backgroundColor('rgba(0,0,0,0.5)')
+        .backgroundColor($r('app.color.overlay_dark_50'))
         .onClick(() => {
           this.showBadgePanel = false
         })
@@ -911,12 +1104,12 @@ export struct Mine {
           Text('我的徽章')
             .fontSize(20)
             .fontWeight(FontWeight.Bold)
-            .fontColor('#ffffff')
+            .fontColor($r('app.color.text_primary'))
             .layoutWeight(1)
           Image($r('app.media.ic_close'))
             .width(22)
             .height(22)
-            .fillColor('#888888')
+            .fillColor($r('app.color.text_quaternary'))
             .onClick(() => {
               this.showBadgePanel = false
             })
@@ -952,7 +1145,7 @@ export struct Mine {
       }
       .width('85%')
       .padding(24)
-      .backgroundColor('#1e1e1e')
+      .backgroundColor($r('app.color.bg_panel'))
       .borderRadius(16)
     }
     .width('100%')
@@ -970,27 +1163,27 @@ export struct Mine {
         .opacity(obtained ? 1 : 0.3)
       Text(name)
         .fontSize(12)
-        .fontColor(obtained ? '#ffffff' : '#666666')
+        .fontColor(obtained ? $r('app.color.text_primary') : $r('app.color.text_disabled'))
         .fontWeight(FontWeight.Medium)
       Text(desc)
         .fontSize(10)
-        .fontColor('#666666')
+        .fontColor($r('app.color.text_disabled'))
         .maxLines(2)
         .textAlign(TextAlign.Center)
       if (obtained) {
         Text('已获得')
           .fontSize(10)
-          .fontColor('#d4a74a')
+          .fontColor($r('app.color.accent_gold'))
           .padding({ left: 6, right: 6, top: 2, bottom: 2 })
-          .border({ width: 0.5, color: '#d4a74a', radius: 8 })
+          .border({ width: 0.5, color: $r('app.color.accent_gold'), radius: 8 })
       }
     }
     .width('100%')
     .padding({ top: 12, bottom: 12 })
     .alignItems(HorizontalAlign.Center)
-    .backgroundColor(obtained ? '#2a2520' : '#1a1a1a')
+    .backgroundColor(obtained ? $r('app.color.bg_badge_obtained') : $r('app.color.bg_section'))
     .borderRadius(10)
-    .border({ width: 0.5, color: obtained ? '#d4a74a' : '#2a2a2a' })
+    .border({ width: 0.5, color: obtained ? $r('app.color.accent_gold') : $r('app.color.bg_elevated') })
   }
 
   // ========== 主 Build ==========
@@ -1024,7 +1217,7 @@ export struct Mine {
                       .width(72 * Math.min(1, this.headerHeight / 260))
                       .height(72 * Math.min(1, this.headerHeight / 260))
                       .borderRadius(36)
-                      .border({ width: 2, color: '#ffffff' })
+                      .border({ width: 2, color: $r('app.color.text_primary') })
                       .shadow({ radius: 8, color: 'rgba(0,0,0,0.15)', offsetX: 0, offsetY: 2 })
                       .scale({ x: this.avatarScale, y: this.avatarScale })
                       .opacity(Math.min(1, this.headerHeight / 120) * this.avatarOpacity)
@@ -1032,11 +1225,15 @@ export struct Mine {
                       .onClick(() => {
                         this.avatarScale = 0.9
                         this.avatarOpacity = 0.8
-                        setTimeout(() => {
+                        if (this.avatarTimer !== -1) {
+                          clearTimeout(this.avatarTimer)
+                        }
+                        this.avatarTimer = setTimeout(() => {
+                          this.avatarTimer = -1
                           this.avatarScale = 1
                           this.avatarOpacity = 1
                         }, 150)
-                        this.editNickname = this.nickname
+                        this.editNickname = this.settings.nickname
                         this.isEditProfileOpen = true
                       })
 
@@ -1044,20 +1241,20 @@ export struct Mine {
                     if (this.headerHeight > 80) {
                       Column({ space: 6 }) {
                         Row({ space: 6 }) {
-                          Text(this.nickname)
+                          Text(this.settings.nickname)
                             .fontSize(18)
                             .fontWeight(FontWeight.Bold)
-                            .fontColor('#ffffff')
+                            .fontColor($r('app.color.text_primary'))
                           Text('P+')
                             .fontSize(10)
-                            .fontColor('#ffffff')
+                            .fontColor($r('app.color.text_primary'))
                             .padding({ left: 4, right: 4, top: 1, bottom: 1 })
-                            .backgroundColor('#ff6b6b')
+                            .backgroundColor($r('app.color.brand_primary_light'))
                             .borderRadius(4)
                           Image($r('app.media.ic_more'))
                             .width(14)
                             .height(14)
-                            .fillColor('#ffffff')
+                            .fillColor($r('app.color.text_primary'))
                         }
                       }
                       .transition(TransitionEffect.OPACITY.animation({ duration: 200 }))
@@ -1069,14 +1266,14 @@ export struct Mine {
                         Image($r('app.media.ic_moment'))
                           .width(16)
                           .height(16)
-                          .fillColor('#d4a74a')
+                          .fillColor($r('app.color.accent_gold'))
                         Text(`${this.badgeCount}枚徽章`)
                           .fontSize(13)
-                          .fontColor('#ffffff')
+                          .fontColor($r('app.color.text_primary'))
                         Image($r('app.media.ic_more'))
                           .width(12)
                           .height(12)
-                          .fillColor('#ffffff')
+                          .fillColor($r('app.color.text_primary'))
                       }
                       .onClick(() => {
                         this.showBadgePanel = true
@@ -1091,19 +1288,19 @@ export struct Mine {
                         Divider()
                           .vertical(true)
                           .strokeWidth(0.5)
-                          .color('rgba(255,255,255,0.3)')
+                          .color($r('app.color.divider_white_30'))
                           .height(20)
                         this.statItem(this.userStats.fans.toString(), '粉丝')
                         Divider()
                           .vertical(true)
                           .strokeWidth(0.5)
-                          .color('rgba(255,255,255,0.3)')
+                          .color($r('app.color.divider_white_30'))
                           .height(20)
                         this.statItem(`Lv.${this.userStats.level}`, '等级')
                         Divider()
                           .vertical(true)
                           .strokeWidth(0.5)
-                          .color('rgba(255,255,255,0.3)')
+                          .color($r('app.color.divider_white_30'))
                           .height(20)
                         this.statItem(`${this.userStats.hours} 小时`, '听歌')
                       }
@@ -1130,13 +1327,13 @@ export struct Mine {
             }
             .width('100%')
             .padding({ left: 8, right: 8, top: 16, bottom: 12 })
-            .backgroundColor('#1a1a1a')
+            .backgroundColor($r('app.color.bg_section'))
 
             // 分隔
             Column()
               .width('100%')
               .height(8)
-              .backgroundColor('#0f0f0f')
+              .backgroundColor($r('app.color.bg_gap'))
 
             // ========== 4. 内容Tab切换 ==========
             Row() {
@@ -1147,11 +1344,11 @@ export struct Mine {
             }
             .width('100%')
             .padding({ top: 12, bottom: 4 })
-            .backgroundColor('#1a1a1a')
+            .backgroundColor($r('app.color.bg_section'))
 
             Divider()
               .strokeWidth(0.5)
-              .color('#2a2a2a')
+              .color($r('app.color.bg_elevated'))
               .width('100%')
 
             // ========== 5. 歌单区域标题 ==========
@@ -1159,34 +1356,34 @@ export struct Mine {
               Text('近期')
                 .fontSize(14)
                 .fontWeight(FontWeight.Bold)
-                .fontColor('#ffffff')
+                .fontColor($r('app.color.text_primary'))
                 .padding({ left: 16, top: 12, bottom: 8 })
               Text('创建¹')
                 .fontSize(12)
-                .fontColor('#888888')
+                .fontColor($r('app.color.text_quaternary'))
                 .padding({ top: 12, bottom: 8 })
               Blank()
               Row({ space: 12 }) {
                 // 排序模式切换
                 Text(this.isSortMode ? '完成' : '排序')
                   .fontSize(13)
-                  .fontColor(this.isSortMode ? '#ec4141' : '#888888')
+                  .fontColor(this.isSortMode ? $r('app.color.brand_primary') : $r('app.color.text_quaternary'))
                   .onClick(() => {
                     this.isSortMode = !this.isSortMode
                   })
                 Image($r('app.media.ic_share'))
                   .width(18)
                   .height(18)
-                  .fillColor('#888888')
+                  .fillColor($r('app.color.text_quaternary'))
                 Image($r('app.media.ic_more'))
                   .width(18)
                   .height(18)
-                  .fillColor('#888888')
+                  .fillColor($r('app.color.text_quaternary'))
                   .margin({ right: 16 })
               }
             }
             .width('100%')
-            .backgroundColor('#1a1a1a')
+            .backgroundColor($r('app.color.bg_section'))
 
             // ========== 6. 歌单列表（竖向） ==========
             Column() {
@@ -1196,7 +1393,7 @@ export struct Mine {
 
               Divider()
                 .strokeWidth(0.5)
-                .color('#2a2a2a')
+                .color($r('app.color.bg_elevated'))
                 .margin({ left: 16, right: 16 })
 
               if (this.createdPlaylists.length > 0) {
@@ -1213,7 +1410,7 @@ export struct Mine {
                         Image($r('app.media.ic_share'))
                           .width(16)
                           .height(16)
-                          .fillColor(index > 0 ? '#888888' : '#444444')
+                          .fillColor(index > 0 ? $r('app.color.text_quaternary') : $r('app.color.icon_muted'))
                           .rotate({ angle: -90 })
                           .onClick(() => {
                             this.movePlaylistUp(index)
@@ -1221,7 +1418,7 @@ export struct Mine {
                         Image($r('app.media.ic_share'))
                           .width(16)
                           .height(16)
-                          .fillColor(index < this.createdPlaylists.length - 1 ? '#888888' : '#444444')
+                          .fillColor(index < this.createdPlaylists.length - 1 ? $r('app.color.text_quaternary') : $r('app.color.icon_muted'))
                           .rotate({ angle: 90 })
                           .onClick(() => {
                             this.movePlaylistDown(index)
@@ -1239,14 +1436,14 @@ export struct Mine {
                   Image($r('app.media.ic_code'))
                     .width(40)
                     .height(40)
-                    .fillColor('#444444')
+                    .fillColor($r('app.color.icon_muted'))
                     .opacity(0.5)
                   Text('还没有创建歌单')
                     .fontSize(14)
-                    .fontColor('#666666')
+                    .fontColor($r('app.color.text_disabled'))
                   Text('点击上方"新建歌单"开始创建')
                     .fontSize(12)
-                    .fontColor('#555555')
+                    .fontColor($r('app.color.text_faint'))
                 }
                 .width('100%')
                 .padding({ top: 24, bottom: 24 })
@@ -1254,13 +1451,13 @@ export struct Mine {
               }
             }
             .width('100%')
-            .backgroundColor('#1a1a1a')
+            .backgroundColor($r('app.color.bg_section'))
 
             // 分隔
             Column()
               .width('100%')
               .height(8)
-              .backgroundColor('#0f0f0f')
+              .backgroundColor($r('app.color.bg_gap'))
 
             // ========== 7. 收藏歌单 ==========
             this.sectionHeader('收藏歌单')
@@ -1276,14 +1473,14 @@ export struct Mine {
                   Image($r('app.media.ic_moment'))
                     .width(40)
                     .height(40)
-                    .fillColor('#444444')
+                    .fillColor($r('app.color.icon_muted'))
                     .opacity(0.5)
                   Text('还没有收藏歌单')
                     .fontSize(14)
-                    .fontColor('#666666')
+                    .fontColor($r('app.color.text_disabled'))
                   Text('去发现页看看吧~')
                     .fontSize(12)
-                    .fontColor('#555555')
+                    .fontColor($r('app.color.text_faint'))
                 }
                 .width('100%')
                 .padding({ top: 30, bottom: 30 })
@@ -1291,13 +1488,13 @@ export struct Mine {
               }
             }
             .width('100%')
-            .backgroundColor('#1a1a1a')
+            .backgroundColor($r('app.color.bg_section'))
 
             // 分隔
             Column()
               .width('100%')
               .height(8)
-              .backgroundColor('#0f0f0f')
+              .backgroundColor($r('app.color.bg_gap'))
 
             // ========== 8. 最近播放 ==========
             Column() {
@@ -1305,19 +1502,19 @@ export struct Mine {
                 Text('最近播放')
                   .fontSize(15)
                   .fontWeight(FontWeight.Bold)
-                  .fontColor('#ffffff')
+                  .fontColor($r('app.color.text_primary'))
                   .layoutWeight(1)
                 Row({ space: 4 }) {
                   Text('全部')
                     .fontSize(13)
-                    .fontColor('#888888')
+                    .fontColor($r('app.color.text_quaternary'))
                   Image($r('app.media.ic_more'))
                     .width(14)
                     .height(14)
-                    .fillColor('#888888')
+                    .fillColor($r('app.color.text_quaternary'))
                 }
                 .onClick(() => {
-                  this.openSongPanel('最近播放', this.getRecentAllSongs())
+                  this.openSongPanel('最近播放', this.getRecentAllSongs(), '还没有播放记录，去听听歌吧~')
                 })
               }
               .width('100%')
@@ -1325,22 +1522,25 @@ export struct Mine {
 
               Scroll() {
                 Row() {
+                  if (this.historyStore.records.length === 0) {
+                    this.recentEmptyPlaceholder()
+                  }
                   // 播放全部入口
                   Column({ space: 6 }) {
                     Column() {
                       Image($r('app.media.wave'))
                         .width(28)
                         .height(28)
-                        .fillColor('#ec4141')
+                        .fillColor($r('app.color.brand_primary'))
                     }
                     .width(55)
                     .height(55)
                     .borderRadius(6)
-                    .backgroundColor('#2a2020')
+                    .backgroundColor($r('app.color.bg_recent_playall'))
                     .justifyContent(FlexAlign.Center)
                     Text('播放全部')
                       .fontSize(11)
-                      .fontColor('#ec4141')
+                      .fontColor($r('app.color.brand_primary'))
                       .maxLines(1)
                       .width(55)
                   }
@@ -1374,12 +1574,12 @@ export struct Mine {
               .height(90)
             }
             .width('100%')
-            .backgroundColor('#1a1a1a')
+            .backgroundColor($r('app.color.bg_section'))
 
             // 底部留白
             Column()
               .height(70)
-              .backgroundColor('#1a1a1a')
+              .backgroundColor($r('app.color.bg_section'))
           }
           .width('100%')
         }
@@ -1387,9 +1587,10 @@ export struct Mine {
         .height('100%')
         .scrollBar(BarState.Off)
         .edgeEffect(EdgeEffect.Spring)
-        .backgroundColor('#131313')
+        .backgroundColor($r('app.color.bg_page'))
         .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
-        .onScroll(() => {
+        // onScroll 自 API 12 起废弃，改用 onDidScroll（滚动完成回调）
+        .onDidScroll(() => {
           this.scrollY = this.scroller.currentOffset().yOffset
           // 滚动时头部区域逐渐收起，最小保留48（导航栏高度）
           this.headerHeight = Math.max(48, 260 - this.scrollY)
@@ -1399,7 +1600,7 @@ export struct Mine {
       .onRefreshing(() => {
         this.handleRefresh()
       })
-      .backgroundColor('#131313')
+      .backgroundColor($r('app.color.bg_page'))
 
       // ========== 9. 歌曲列表面板（弹出层） ==========
       if (this.isSongPanelOpen) {
@@ -1409,6 +1610,11 @@ export struct Mine {
       // ========== 10. 编辑资料弹窗 ==========
       if (this.isEditProfileOpen) {
         this.editProfileDialog()
+      }
+
+      // ========== 10.1 歌单名称弹窗 ==========
+      if (this.isPlaylistDialogOpen) {
+        this.playlistNameDialog()
       }
 
       // ========== 11. 徽章面板 ==========

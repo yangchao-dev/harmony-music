@@ -6,7 +6,7 @@ export function StartBuilder() {
 }
 
 // 自定义组件装饰器
-@Component
+@ComponentV2
 struct Start {
   // 导航路径栈实例，用于管理页面导航
   pathStack: NavPathStack = new NavPathStack()
@@ -18,7 +18,8 @@ struct Start {
   aboutToAppear(): void {
     // 3秒后自动跳转到布局页（替换当前页面，返回时跳过广告页）
     // 把定时器id赋给timeId
-     this.timeId = setTimeout(() => {
+    this.timeId = setTimeout(() => {
+      this.timeId = -1
       this.pathStack.replacePathByName('Layout', null, false)
     }, 3000)
 
@@ -26,8 +27,11 @@ struct Start {
 
   // 组件销毁时触发
   aboutToDisappear(): void {
-    // 清除定时器
-    clearTimeout(this.timeId)
+    // 清除定时器，防止销毁后回调访问已释放的 pathStack
+    if (this.timeId !== -1) {
+      clearTimeout(this.timeId)
+      this.timeId = -1
+    }
   }
 
 

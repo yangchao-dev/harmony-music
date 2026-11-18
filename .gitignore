@@ -33,3 +33,8 @@ signature/
 Thumbs.db
 *.log
 *.tmp
+
+# 本地调试脚本（不进仓库）
+.dbg_lines.py
+.parse_prof.py
+.parse_prof.ps1

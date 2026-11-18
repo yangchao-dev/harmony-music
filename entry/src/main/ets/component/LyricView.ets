@@ -1,27 +1,14 @@
 import { LyricItem } from '../models/LyricItem'
-import { GlobalMusic } from '../models/globalMusic'
-import { AppStorageV2 } from '@kit.ArkUI'
+import { PlayerState, getPlayerState } from '../models/PlayerState'
 import { playerManager } from '../utils/AvPlayerManager'
-
-/**
- * 预设颜色主题
- */
-const COLOR_THEMES: LyricColorTheme[] = [
-  { name: '纯白', activeColor: '#FFFFFF', inactiveColor: '#88ffffff' },
-  { name: '金色', activeColor: '#FFD700', inactiveColor: '#88ffd700' },
-  { name: '青色', activeColor: '#00CED1', inactiveColor: '#8800ced1' },
-  { name: '粉红', activeColor: '#FF69B4', inactiveColor: '#88ff69b4' },
-  { name: '橙黄', activeColor: '#FFA500', inactiveColor: '#88ffa500' },
-]
-
-/** 歌词轮询间隔（毫秒），用 50ms 高频轮询确保跟音频同步 */
-const LYRIC_TICK_MS: number = 50
-
-interface LyricColorTheme {
-  name: string
-  activeColor: string
-  inactiveColor: string
-}
+import { computeLyricIndex } from '../utils/Formatter'
+import {
+  LYRIC_COLOR_THEMES,
+  LyricColorTheme,
+  SettingsStore,
+  getSettingsStore,
+  preferencesService
+} from '../models/UserSettings'
 
 @ComponentV2
 export struct LyricView {
@@ -30,13 +17,11 @@ export struct LyricView {
   @Event onBackToDisc?: () => void
 
   // 当前播放歌曲信息
-  @Local playState: GlobalMusic = AppStorageV2.connect(GlobalMusic, 'SONG_KEY', () => new GlobalMusic())!
+  playState: PlayerState = getPlayerState()
+  // 用户偏好（字号/配色统一走这里，退出应用后仍保留）
+  settings: SettingsStore = getSettingsStore()
   // 当前高亮的歌词行索引
   @Local currentIndex: number = -1
-  // 字体大小：12~24，默认 15
-  @Local fontSize: number = 15
-  // 当前颜色主题索引
-  @Local themeIndex: number = 0
   // 是否处于用户手动拖拽模式（拖拽时暂停自动滚动）
   @Local isUserScrolling: boolean = false
   // 显示设置面板
@@ -45,41 +30,37 @@ export struct LyricView {
   private scroller: Scroller = new Scroller()
   /** 用户手动滚动的恢复定时器 */
   private resumeScrollTimer: number = -1
-  /** 歌词轮询定时器 */
-  private lyricTickTimer: number = -1
   /** 上次已滚动到的索引，避免重复滚动 */
   private lastScrolledIndex: number = -1
 
   // ========== 生命周期 ==========
 
   aboutToAppear(): void {
-    this.startLyricTick()
+    // 进入时按当前进度对齐一次高亮行
+    this.updateLyricByTime(this.playState.time)
   }
 
   aboutToDisappear(): void {
-    this.stopLyricTick()
-  }
-
-  // ========== 歌词轮询 ==========
-
-  /** 启动歌词轮询定时器 */
-  private startLyricTick(): void {
-    this.stopLyricTick()
-    this.lyricTickTimer = setInterval(() => {
-      this.tickLyric()
-    }, LYRIC_TICK_MS)
-  }
-
-  /** 停止歌词轮询定时器 */
-  private stopLyricTick(): void {
-    if (this.lyricTickTimer !== -1) {
-      clearInterval(this.lyricTickTimer)
-      this.lyricTickTimer = -1
+    // 清理手动滚动恢复定时器，避免组件销毁后定时器回调访问已释放的 scroller
+    if (this.resumeScrollTimer !== -1) {
+      clearTimeout(this.resumeScrollTimer)
+      this.resumeScrollTimer = -1
     }
   }
 
-  /** 每次 tick 时检查播放时间，更新高亮行和滚动位置 */
-  private tickLyric(): void {
+  // ========== 单一数据源驱动 ==========
+
+  /**
+   * 监听播放时间变化驱动歌词高亮与滚动。
+   * timeUpdate 更新 playState.time 时触发，替代 50ms 轮询定时器，显著降低功耗。
+   */
+  @Monitor('playState.time')
+  onTimeChange() {
+    this.updateLyricByTime(this.playState.time)
+  }
+
+  /** 根据播放时间更新高亮行并平滑滚动 */
+  private updateLyricByTime(timeMs: number): void {
     if (!this.isVisible) {
       return
     }
@@ -89,9 +70,7 @@ export struct LyricView {
     if (this.isUserScrolling) {
       return
     }
-    // 直接从播放器获取实时播放位置，避免 AppStorageV2.connect 在定时器闭包中无法拿到最新值
-    const realTime = playerManager.player?.currentTime ?? this.playState.time
-    const newIndex = this.computeCurrentIndex(realTime)
+    const newIndex = this.computeCurrentIndex(timeMs)
     if (newIndex !== this.currentIndex) {
       this.currentIndex = newIndex
       this.scrollToLyricIndex(newIndex)
@@ -101,27 +80,15 @@ export struct LyricView {
   // ========== 核心逻辑 ==========
 
   /**
-   * 根据当前播放时间计算当前歌词行索引（二分查找）
+   * 根据当前播放时间计算当前歌词行索引（二分查找，实现见 utils/Formatter.ets）
    * @param currentTime 当前播放时间，单位毫秒
    */
   computeCurrentIndex(currentTime: number): number {
     if (!this.lyrics || this.lyrics.length === 0) {
       return -1
     }
-    // 歌词按时间升序排列，用二分查找最后一个 time <= currentTime 的索引
-    let lo = 0
-    let hi = this.lyrics.length - 1
-    let result = -1
-    while (lo <= hi) {
-      const mid = (lo + hi) >>> 1
-      if (this.lyrics[mid].time <= currentTime) {
-        result = mid
-        lo = mid + 1
-      } else {
-        hi = mid - 1
-      }
-    }
-    return result
+    const times: number[] = this.lyrics.map((item: LyricItem) => item.time)
+    return computeLyricIndex(times, currentTime)
   }
 
   /**
@@ -147,13 +114,19 @@ export struct LyricView {
   }
 
   /**
-   * 调整字体大小
+   * 调整字体大小（同时落盘，退出后仍保留）
    */
   adjustFontSize(delta: number) {
-    const newSize = this.fontSize + delta
-    if (newSize >= 12 && newSize <= 24) {
-      this.fontSize = newSize
+    if (delta > 0) {
+      preferencesService.increaseLyricFontSize()
+    } else if (delta < 0) {
+      preferencesService.decreaseLyricFontSize()
     }
+  }
+
+  /** 切换配色主题（同时落盘） */
+  selectTheme(index: number) {
+    preferencesService.setLyricThemeIndex(index)
   }
 
   /** 歌词数据变化时（切歌）重置状态 */
@@ -169,7 +142,7 @@ export struct LyricView {
    * 获取当前主题
    */
   getCurrentTheme(): LyricColorTheme {
-    return COLOR_THEMES[this.themeIndex]
+    return LYRIC_COLOR_THEMES[this.settings.lyricThemeIndex] ?? LYRIC_COLOR_THEMES[0]
   }
 
   build() {
@@ -242,7 +215,7 @@ export struct LyricView {
                     .borderRadius(14)
                     .onClick(() => this.adjustFontSize(-1))
 
-                  Text(this.fontSize.toString())
+                  Text(this.settings.lyricFontSize.toString())
                     .fontSize(14)
                     .fontColor(Color.White)
                     .width(30)
@@ -267,9 +240,9 @@ export struct LyricView {
                   .width(40)
 
                 Row({ space: 8 }) {
-                  ForEach(COLOR_THEMES, (theme: LyricColorTheme, idx: number) => {
+                  ForEach(LYRIC_COLOR_THEMES, (theme: LyricColorTheme, idx: number) => {
                     Row() {
-                      if (this.themeIndex === idx) {
+                      if (this.settings.lyricThemeIndex === idx) {
                         Text('✓')
                           .fontSize(10)
                           .fontColor(theme.activeColor)
@@ -280,13 +253,13 @@ export struct LyricView {
                     .borderRadius(14)
                     .backgroundColor(theme.activeColor + '33')
                     .border({
-                      width: this.themeIndex === idx ? 2 : 0,
+                      width: this.settings.lyricThemeIndex === idx ? 2 : 0,
                       color: theme.activeColor,
                       radius: 14
                     })
                     .justifyContent(FlexAlign.Center)
                     .onClick(() => {
-                      this.themeIndex = idx
+                      this.selectTheme(idx)
                     })
                   })
                 }
@@ -315,7 +288,7 @@ export struct LyricView {
               ForEach(this.lyrics, (item: LyricItem, index: number) => {
                 ListItem() {
                   Text(item.text)
-                    .fontSize(index === this.currentIndex ? this.fontSize + 3 : this.fontSize)
+                    .fontSize(index === this.currentIndex ? this.settings.lyricFontSize + 3 : this.settings.lyricFontSize)
                     .fontWeight(index === this.currentIndex ? FontWeight.Bold : FontWeight.Normal)
                     .fontColor(index === this.currentIndex ?
                       this.getCurrentTheme().activeColor :
